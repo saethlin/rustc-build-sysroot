@@ -102,7 +102,7 @@ pub enum SysrootConfig {
 /// Information about a to-be-created sysroot.
 pub struct SysrootBuilder {
     sysroot_dir: PathBuf,
-    target: OsString,
+    targets: Vec<OsString>,
     config: SysrootConfig,
     mode: BuildMode,
     rustflags: Vec<OsString>,
@@ -116,10 +116,10 @@ const HASH_FILE_NAME: &str = ".rustc-build-sysroot-hash";
 impl SysrootBuilder {
     /// Prepare to create a new sysroot in the given folder (that folder should later be passed to
     /// rustc via `--sysroot`), for the given target.
-    pub fn new(sysroot_dir: &Path, target: impl Into<OsString>) -> Self {
+    pub fn new(sysroot_dir: &Path, targets: impl IntoIterator<Item = OsString>) -> Self {
         SysrootBuilder {
             sysroot_dir: sysroot_dir.to_owned(),
-            target: target.into(),
+            targets: targets.into_iter().map(|t| t.to_owned()).collect(),
             config: SysrootConfig::WithStd {
                 std_features: vec![],
             },
@@ -166,19 +166,19 @@ impl SysrootBuilder {
         self
     }
 
-    fn target_name(&self) -> &OsStr {
-        let path = Path::new(&self.target);
+    fn target_name(target: &OsStr) -> &OsStr {
+        let path = Path::new(target);
         // If this is a filename, the name is obtained by stripping directory and extension.
         // That will also work fine for built-in target names.
         path.file_stem()
             .expect("target name must contain a file name")
     }
 
-    fn target_dir(&self) -> PathBuf {
+    fn target_dir(&self, target: &OsStr) -> PathBuf {
         self.sysroot_dir
             .join("lib")
             .join("rustlib")
-            .join(&self.target_name())
+            .join(Self::target_name(target))
     }
 
     /// Computes the hash for the sysroot, so that we know whether we have to rebuild.
@@ -200,8 +200,8 @@ impl SysrootBuilder {
         hasher.finish()
     }
 
-    fn sysroot_read_hash(&self) -> Option<u64> {
-        let hash_file = self.target_dir().join("lib").join(HASH_FILE_NAME);
+    fn sysroot_read_hash(&self, target: &OsStr) -> Option<u64> {
+        let hash_file = self.target_dir(target).join("lib").join(HASH_FILE_NAME);
         let hash = fs::read_to_string(&hash_file).ok()?;
         hash.parse().ok()
     }
@@ -217,8 +217,6 @@ impl SysrootBuilder {
                 src_dir
             );
         }
-        let target_lib_dir = self.target_dir().join("lib");
-        let target_name = self.target_name().to_owned();
         let cargo = self.cargo.take().unwrap_or_else(|| {
             Command::new(env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")))
         });
@@ -229,7 +227,13 @@ impl SysrootBuilder {
 
         // Check if we even need to do anything.
         let cur_hash = self.sysroot_compute_hash(src_dir, &rustc_version);
-        if self.sysroot_read_hash() == Some(cur_hash) {
+
+        let targets_to_build: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|target| self.sysroot_read_hash(target) != Some(cur_hash))
+            .collect();
+        if targets_to_build.is_empty() {
             // Already done!
             return Ok(());
         }
@@ -327,10 +331,12 @@ path = {src_dir_workspace_std:?}
         cmd.arg("--release");
         cmd.arg("--manifest-path");
         cmd.arg(&manifest_file);
-        cmd.arg("--target");
-        cmd.arg(&self.target);
+        for target in &targets_to_build {
+            cmd.arg("--target");
+            cmd.arg(target);
+        }
         // Set rustflags.
-        let mut flags = self.rustflags;
+        let mut flags = self.rustflags.clone();
         flags.push("-Zforce-unstable-if-unmarked".into());
         cmd.env("CARGO_ENCODED_RUSTFLAGS", encode_rustflags(&flags));
         // Make sure the results end up where we expect them.
@@ -352,42 +358,48 @@ path = {src_dir_workspace_std:?}
 
         // Copy the output to a staging dir (so that we can do the final installation atomically.)
         fs::create_dir_all(&self.sysroot_dir).context("failed to create sysroot dir")?; // TempDir expects the parent to already exist
-        let staging_dir =
-            TempDir::new_in(&self.sysroot_dir).context("failed to create staging dir")?;
-        let out_dir = build_target_dir
-            .join(&target_name)
-            .join("release")
-            .join("deps");
-        for entry in fs::read_dir(&out_dir).context("failed to read cargo out dir")? {
-            let entry = entry.context("failed to read cargo out dir entry")?;
-            assert!(
-                entry.file_type().unwrap().is_file(),
-                "cargo out dir must not contain directories"
-            );
-            let entry = entry.path();
-            fs::copy(&entry, staging_dir.path().join(entry.file_name().unwrap()))
-                .context("failed to copy cargo out file")?;
-        }
+        for target in targets_to_build {
+            let target_name = Self::target_name(target);
+            let target_dir = self.target_dir(target);
+            let staging_dir =
+                TempDir::new_in(&self.sysroot_dir).context("failed to create staging dir")?;
+            let target_lib_dir = target_dir.join("lib");
+            let out_dir = build_target_dir
+                .join(&target_name)
+                .join("release")
+                .join("deps");
+            for entry in fs::read_dir(&out_dir).context("failed to read cargo out dir")? {
+                let entry = entry.context("failed to read cargo out dir entry")?;
+                assert!(
+                    entry.file_type().unwrap().is_file(),
+                    "cargo out dir must not contain directories"
+                );
+                let entry = entry.path();
+                fs::copy(&entry, staging_dir.path().join(entry.file_name().unwrap()))
+                    .context("failed to copy cargo out file")?;
+            }
 
-        // Write the hash file (into the staging dir).
-        fs::write(
-            staging_dir.path().join(HASH_FILE_NAME),
-            cur_hash.to_string().as_bytes(),
-        )
-        .context("failed to write hash file")?;
+            // Write the hash file (into the staging dir).
+            fs::write(
+                staging_dir.path().join(HASH_FILE_NAME),
+                cur_hash.to_string().as_bytes(),
+            )
+            .context("failed to write hash file")?;
 
-        // Atomic copy to final destination via rename.
-        if target_lib_dir.exists() {
-            // Remove potentially outdated files.
-            fs::remove_dir_all(&target_lib_dir).context("failed to clean sysroot target dir")?;
+            // Atomic copy to final destination via rename.
+            if target_lib_dir.exists() {
+                // Remove potentially outdated files.
+                fs::remove_dir_all(&target_lib_dir)
+                    .context("failed to clean sysroot target dir")?;
+            }
+            fs::create_dir_all(
+                target_lib_dir
+                    .parent()
+                    .expect("target/lib dir must have a parent"),
+            )
+            .context("failed to create target directory")?;
+            fs::rename(staging_dir.path(), target_lib_dir).context("failed installing sysroot")?;
         }
-        fs::create_dir_all(
-            target_lib_dir
-                .parent()
-                .expect("target/lib dir must have a parent"),
-        )
-        .context("failed to create target directory")?;
-        fs::rename(staging_dir.path(), target_lib_dir).context("failed installing sysroot")?;
 
         Ok(())
     }
