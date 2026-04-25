@@ -571,9 +571,10 @@ fn copy_files(from: &Path, to: &Path) -> Result<()> {
         let file_type = entry.file_type()?;
         assert!(
             file_type.is_file(),
-            "cargo out dir must not contain directories, found {:?} which is {:?}",
+            "cargo out dir must not contain directories, found {:?} which is {:?}\n{:?}",
             entry.path(),
-            file_type
+            file_type,
+            std::fs::metadata(entry.path()),
         );
         fs::copy(&entry.path(), to.join(entry.file_name()))?;
     }
