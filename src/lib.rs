@@ -9,6 +9,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -444,11 +445,13 @@ impl<'a> SysrootBuilder<'a> {
         let _ = fs::rename(&sysroot_target_dir, &unstaging_dir); // rename may fail if the dir does not exist yet
 
         // Prepare a workspace for cargo
-        let build_dir = tempfile::Builder::new()
-            .prefix("rustc-build-sysroot-")
-            .disable_cleanup(self.keep_build_dir)
-            .tempdir()
-            .context("failed to create tempdir")?;
+        let build_dir = ManuallyDrop::new(
+            tempfile::Builder::new()
+                .prefix("rustc-build-sysroot-")
+                .disable_cleanup(self.keep_build_dir)
+                .tempdir()
+                .context("failed to create tempdir")?,
+        );
         // Cargo.lock
         let lock_file = build_dir.path().join("Cargo.lock");
         let lock_file_src = {
@@ -554,6 +557,8 @@ impl<'a> SysrootBuilder<'a> {
                 bail!("detected a concurrent sysroot build with different settings");
             }
         }
+
+        ManuallyDrop::into_inner(build_dir);
 
         Ok(SysrootStatus::SysrootBuilt)
     }
